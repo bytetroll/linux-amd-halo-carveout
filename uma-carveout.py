@@ -74,14 +74,18 @@ def read_current(uma):
         return int(fh.read().strip())
 
 
-def total_ram_mb(uma):
-    """Installed RAM = what firmware carved out + what the OS can see."""
+def read_vram_mb(uma):
+    """The carveout the GPU actually got, as amdgpu reports it."""
     card = os.path.dirname(uma)
     with open(os.path.join(card, "mem_info_vram_total")) as fh:
-        vram_mb = int(fh.read().strip()) // (1024 * 1024)
+        return int(fh.read().strip()) // (1024 * 1024)
+
+
+def total_ram_mb(uma):
+    """Installed RAM = what firmware carved out + what the OS can see."""
     with open("/proc/meminfo") as fh:
         kb = int(re.search(r"MemTotal:\s+(\d+)", fh.read()).group(1))
-    return vram_mb + kb // 1024
+    return read_vram_mb(uma) + kb // 1024
 
 
 def acpi_gpu_path(uma):
@@ -123,9 +127,26 @@ def cmd_list(args):
         size = fmt_size(mb)
         print(f"  {'*' if idx == cur else ' '}{idx:>2}  {name:<10}  {size:<14}"
               f"  {gib(total - mb):>6.1f} GiB  {label}")
+    if cur not in {i for i, _, _ in opts}:
+        # An index written through ATCS need not be one the firmware
+        # advertises. Without this row nothing is starred and `list` looks
+        # broken on exactly the machines this tool exists to configure.
+        vram = read_vram_mb(uma)
+        label = next((k for k, v in PRESETS.items() if v == vram), "")
+        print(f"  *{cur:>2}  {'unlisted':<10}  {fmt_size(vram):<14}"
+              f"  {gib(total - vram):>6.1f} GiB  {label}")
     print("\n  * = active")
 
-    missing = {k: v for k, v in PRESETS.items() if v not in by_mb}
+    if cur not in {i for i, _, _ in opts}:
+        print(f"\n  index {cur} is absent from carveout_options: it was set "
+              "through ATCS, so only\n  mem_info_vram_total attests to the "
+              "size. The sysfs path cannot reselect it.")
+
+    # Whatever is running is reachable by definition, even if unadvertised,
+    # so listing it as unavailable would contradict the starred row above.
+    running = read_vram_mb(uma)
+    missing = {k: v for k, v in PRESETS.items()
+               if v not in by_mb and v != running}
     if missing:
         names = ", ".join(f"{k} ({fmt_size(v)})" for k, v in missing.items())
         print(f"\nnot advertised by this firmware: {names}")
@@ -261,12 +282,30 @@ def ensure_acpi_call():
                      "`mokutil --test-key`.")
     die("\n".join(lines))
 
+def acpi_call_log():
+    """acpi_call rejects malformed arguments through printk and nothing else."""
+    try:
+        r = subprocess.run(["dmesg"], capture_output=True, text=True, check=False)
+    except OSError:
+        return []
+    return [l for l in r.stdout.splitlines() if "acpi_call:" in l]
+
+
 def atcs_call(uma, index, type_, dry_run):
     # struct atcs_set_uma_allocation_size_input {
     #     u16 size; u8 uma_size_index; u8 uma_size_type; } __packed;
-    buf = f"b0x04,0x00,{index:#04x},{type_:#04x}"
+    for name, val in (("index", index), ("type", type_)):
+        if not 0 <= val <= 0xF:
+            die(f"--{name} {val} does not fit in 4 bits; ATCA masks both "
+                "fields with 0x0F, so the firmware would get a different "
+                "request than the one you asked for")
+    payload = bytes((0x04, 0x00, index, type_))
+    # acpi_call's bNNNN argument is bare contiguous hex - no 0x, no commas.
+    # It reads to the next space and wants an even digit count; anything else
+    # is refused during parsing and the method is never evaluated.
+    buf = "b" + payload.hex()
     print(f"ATCS function {ATCS_SET_UMA:#x}  index={index} type={type_}")
-    print(f"  buffer: {buf}")
+    print(f"  buffer: {buf}  -> ATCA packs {(type_ << 4) | index:#04x}")
     if dry_run:
         print("(dry run)")
         return
@@ -275,6 +314,7 @@ def atcs_call(uma, index, type_, dry_run):
 
     errors = []
     for path in atcs_candidates(uma):
+        before = len(acpi_call_log())
         try:
             with open(CALL, "w") as fh:
                 fh.write(f"{path} {ATCS_SET_UMA:#x} {buf}")
@@ -283,8 +323,15 @@ def atcs_call(uma, index, type_, dry_run):
         except OSError as e:
             errors.append(f"{path}: {e}")
             continue
-        if res.lower().startswith("error"):
-            errors.append(f"{path}: {res}")
+        complaints = acpi_call_log()[before:]
+        # "not called" is the module's idle result, not an outcome: it means
+        # the write was accepted but nothing was evaluated. Treating it as
+        # success silently wastes a reboot.
+        if not res or res == "not called" or res.lower().startswith("error"):
+            why = "; ".join(c.split("acpi_call:", 1)[-1].strip()
+                            for c in complaints)
+            errors.append(f"{path}: {res or 'no result'}"
+                          + (f" ({why})" if why else ""))
             continue
         print(f"  {path} -> {res}")
         print("ok - reboot, then check mem_info_vram_total")
