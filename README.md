@@ -1,0 +1,172 @@
+# strix-halo-uma-carveout
+
+Read and set the dedicated-VRAM split (the UMA carveout) on AMD Strix Halo /
+Ryzen AI Max systems **from Linux**, without AMD's Windows driver and without
+AMD's own Linux distribution.
+
+```
+$ ./uma-carveout.py list
+installed memory : ~125.6 GiB
+acpi gpu path    : \_SB_.PCI0.GPPA.VGA_
+sysfs            : /sys/class/drm/card1/device/uma/carveout
+
+  idx  name        carveout        OS sees      preset
+  ---  ----------  --------------  -----------  ------
+    0  Minimum     512 MB           125.1 GiB  min
+    1  -           1 GiB            124.6 GiB
+    2  -           2 GiB            123.6 GiB
+    3  -           4 GiB            121.6 GiB
+    4  -           8 GiB            117.6 GiB
+    5  -           16 GiB           109.6 GiB
+    6  Medium      32 GiB            93.6 GiB  32
+  * 7  High        64 GiB            61.6 GiB  64
+
+  * = active
+```
+
+## The problem
+
+On a 128 GB Ryzen AI Max+ 395 box, how much memory is dedicated to the iGPU is
+the single most consequential setting for local AI work. On several of these
+systems — including AMD's own **Ryzen AI Halo developer platform (RAH-001)** —
+it is **not in BIOS setup at all**. AMD expects you to change it from software:
+
+| OS | where the slider lives |
+| --- | --- |
+| Windows | AMD Software: Adrenalin Edition >= 26.5.1 -> Performance -> Tuning -> Variable Graphics Memory |
+| Linux | AMD Ryzen AI Developer Center -> Settings -> Graphics Performance Settings |
+
+The catch: that Linux app ships **only** inside AMD's own Debian-based distro,
+*AMD Ryzen AI Developer Platform 1 "Rex"*. AMD documents it as "a permanent
+component of the AMD Ryzen AI Halo's Linux software stack" that "cannot be
+uninstalled" — there is no standalone `.deb`, no apt repo, and no published
+Rex ISO. Install Ubuntu, Fedora or anything else and the setting becomes
+unreachable, along with the BIOS updater that lives in the same app.
+
+HP's Strix Halo machines (Z2 Mini G1a, ZBook Ultra G1a) *do* expose a BIOS
+dropdown. AMD's reference box does not.
+
+## What actually controls it
+
+Not the OS. The carveout is written to firmware NVRAM and applied at POST, so a
+change needs a reboot but survives OS reinstalls. There are two ways in.
+
+### 1. sysfs — supported, limited
+
+AMD upstreamed `drm/amdgpu: add UMA carveout tuning interfaces` (Dec 2025).
+Where present it gives you:
+
+```
+/sys/class/drm/card*/device/uma/carveout_options   # read-only, firmware's list
+/sys/class/drm/card*/device/uma/carveout           # read/write index, next boot
+```
+
+These files exist only on kernels new enough to carry the series **and** on
+firmware that implements ATCS function `0x0A`. If `uma/` is missing, one of the
+two is too old. Verified present on Ubuntu 26.04 / kernel 7.0.
+
+It is **index-only by design** — you can select only sizes the Atom ROM
+advertises. That is a driver policy, not a firmware limit.
+
+### 2. ACPI ATCS function 0x0A — what the above calls underneath
+
+The firmware method does no bounds checking whatsoever, and masks the index and
+type to four bits each, so it can express sixteen of each. This is also the path
+Adrenalin's "Custom" mode uses to reach sizes the preset list omits.
+See **[docs/atcs-atca.md](docs/atcs-atca.md)** for the disassembled ASL.
+
+## Install
+
+```
+git clone <this repo> && cd strix-halo-uma-carveout
+sudo apt install acpica-tools      # for `probe` only
+sudo apt install acpi-call-dkms    # for `set --via atcs` only
+```
+
+No dependencies beyond the standard library. `list` needs no root.
+
+## Usage
+
+```
+./uma-carveout.py list                    # firmware's options + the active one
+sudo ./uma-carveout.py set 64             # by size: min, 32, 64, 96, or NN GiB
+sudo ./uma-carveout.py set 32 --dry-run   # show what would change
+sudo ./uma-carveout.py set --index 6      # by raw option index
+sudo ./uma-carveout.py trace              # what index/type does the driver send?
+sudo ./uma-carveout.py probe              # disassemble your firmware's ATCS
+```
+
+`set` writes the index, verifies the readback, and tells you to reboot. It
+refuses sizes your firmware does not advertise rather than quietly poking ACPI.
+
+`trace` kprobes `amdgpu_acpi_set_uma_allocation_size` and walks the advertised
+indices through the supported sysfs path, recording the `index`/`type` pair the
+driver sends for each, then restores your original setting. The firmware only
+ever sees values it declared itself. Use it to read a known-good `type` byte out
+of the driver instead of guessing one.
+
+## Known firmware option tables
+
+| System | BIOS | RAM | Advertised carveouts |
+| --- | --- | --- | --- |
+| AMD Ryzen AI Halo (RAH-001) | 03.03 | 128 GB | 512 MB, 1, 2, 4, 8, 16, 32, 64 GiB |
+| mainline kernel doc example | — | — | 10 entries, topping out at 32 GB |
+
+**Please send yours.** Paste `./uma-carveout.py list` output plus your BIOS
+version into an issue and it goes in the table. Whether any firmware advertises
+96 GB is the open question below.
+
+## The 96 GB question
+
+AMD describes the RAH-001 as configurable to 96 GB dedicated (leaving 32 GB for
+the OS), reached on Windows through Adrenalin's **Custom** Variable Graphics
+Memory mode. On BIOS 03.03 the Atom ROM table stops at 64 GB, so the supported
+Linux path cannot request it — but the firmware's ASL will pack index 8 without
+complaint. See [docs/atcs-atca.md](docs/atcs-atca.md).
+
+**This is unverified.** If you try it, please report the outcome either way.
+
+```
+sudo ./uma-carveout.py trace                                   # get T
+sudo ./uma-carveout.py set 96 --via atcs --index 8 --type T
+```
+
+## Consider GTT before a big carveout
+
+On Linux you often do not want a large carveout at all. `amdgpu` can lend the
+GPU ordinary system RAM through the GTT, on demand, and hand it back — so a
+small carveout plus a high GTT ceiling can give the GPU more addressable memory
+than the largest carveout your firmware offers, while leaving idle pages to the
+OS. This is the second slider in AMD's app, and it is pure kernel cmdline:
+
+```
+amdgpu.gttsize=<MB>  ttm.pages_limit=<MB * 256>
+```
+
+The default is auto, which is half of visible system RAM.
+[`contrib/gtt-ceiling.sh`](contrib/gtt-ceiling.sh) sets both for you on GRUB
+systems. Caveat: reported VRAM does not change, so tools that size allocations
+off `mem_info_vram_total` may plan badly against a tiny carveout — verify with a
+real workload rather than trusting the numbers.
+
+## Risk and recovery
+
+Changing an *advertised* carveout through sysfs is the supported path and is as
+safe as the BIOS dropdown on an HP box.
+
+The `--via atcs` path sends a value your firmware never advertised. The most
+likely outcome for an unrecognised value is that nothing changes, because the
+SMM handler ignores it — but that handler is not readable from the OS, so this
+is an experiment, not a guarantee. If the machine will not POST afterwards,
+clear CMOS: unplug and pull the coin cell. Both `UmaCarveOutDefault` and
+`UmaCarveOutIndexDefault` exist as EFI variables, consistent with the firmware
+keeping its own fallback.
+
+No warranty; see [LICENSE](LICENSE).
+
+## References
+
+- [AMD Ryzen AI Halo User Guide](https://developer.amd.com/playbooks/user-guide/)
+- [`drm/amdgpu: add UMA carveout tuning interfaces`](https://lwn.net/Articles/1046512/)
+- [Misc AMDGPU driver information](https://docs.kernel.org/gpu/amdgpu/driver-misc.html) — merged sysfs docs
+- [Phoronix: AMD's own Linux distribution built atop Debian](https://www.phoronix.com/review/ryzen-ai-linux-os)
