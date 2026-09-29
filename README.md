@@ -28,6 +28,23 @@ sysfs            : /sys/class/drm/card1/device/uma/carveout
   mem_info_vram_total attests to the size. The sysfs path cannot reselect it.
 ```
 
+## Two things to know before you start
+
+**Look in BIOS setup first.** HP's Strix Halo machines (Z2 Mini G1a, ZBook Ultra
+G1a) put a VRAM dropdown in firmware setup. That path is supported, reversible
+from the same screen, and needs no out-of-tree kernel module, no MOK enrollment
+and no Secure Boot exception — so if it is there, use it and close this page.
+Everything below exists for the machines where the setting is genuinely absent,
+AMD's own RAH-001 reference platform among them. `--via atcs` in particular
+writes an unvalidated value straight to an SMI handler; it is a last resort, not
+a first one.
+
+**A 96 GiB carveout reports as "103 GB".** `mem_info_vram_total` is in bytes, and
+`103079215104` is exactly 96 × 1024³. Tools that divide by 1024³ say 96 GiB;
+tools that divide by 1000³ say 103.08 GB. Both are the same carveout, and neither
+is a sign that you got more memory than you asked for. Expect to meet this the
+first time you compare a GUI monitor against a BIOS screen.
+
 ## The problem
 
 On a 128 GB Ryzen AI Max+ 395 box, how much memory is dedicated to the iGPU is
@@ -158,9 +175,13 @@ $ cat /sys/class/drm/card1/device/mem_info_vram_total
 103079215104                       # 96 GiB exactly (96 * 1024**3)
 ```
 
-The SMM handler accepts the unadvertised index and POST applies it. Note that
-`103079215104` bytes is 96 **GiB**; tools that divide by 1000^3 render the same
-carveout as "103 GB". Nothing extra was gained — it is the 96 GiB AMD documents.
+The SMM handler accepts the unadvertised index and POST applies it.
+
+![GNOME Resources, GPU page: Radeon 8060S Graphics, Video Memory Usage 872.06 MB / 103.08 GB](docs/img/96gib-carveout-resources.png)
+
+*The carveout as a desktop monitor sees it — and the unit trap in the wild.
+103.08 GB here is the same 96 GiB the kernel reports; GNOME Resources divides by
+1000³. Nothing extra was gained: it is the 96 GiB AMD documents.*
 
 Afterwards `carveout` reads back `8` while `carveout_options` still stops at 7,
 so the sysfs path can no longer reselect the running size. `set 64` (or any
