@@ -363,6 +363,8 @@ TRACE = "/sys/kernel/tracing"
 KPROBE_SYM = "amdgpu_acpi_set_uma_allocation_size"
 KPROBE_NAME = "umaset"
 HIT_RE = re.compile(r"index=(\d+)\s+type=(\d+)")
+# bpftrace says "Attaching 1 probe..." on older builds, "Attached 1 probe" on newer.
+READY_RE = re.compile(r"Attach(?:ing|ed)\b", re.I)
 
 
 def _w(path, data, mode="w"):
@@ -453,13 +455,18 @@ def collect_bpftrace(indices, node):
                             stdout=fh, stderr=subprocess.STDOUT)
     try:
         deadline = time.time() + 20
-        while "Attaching" not in open(out, errors="replace").read():
+        while True:
+            text = open(out, errors="replace").read()
+            if READY_RE.search(text):
+                break
             if proc.poll() is not None:
-                die("bpftrace exited before attaching:\n"
-                    + open(out, errors="replace").read().strip())
+                die("bpftrace exited before attaching:\n" + text.strip())
             if time.time() > deadline:
-                die("bpftrace did not attach within 20s:\n"
-                    + open(out, errors="replace").read().strip())
+                # Banner wording has changed before; if it is still running,
+                # assume it attached rather than giving up on a cosmetic string.
+                print("warning: no recognised bpftrace attach banner; proceeding\n"
+                      f"         output so far: {text.strip()!r}", file=sys.stderr)
+                break
             time.sleep(0.2)
         time.sleep(0.3)
         print(f"backend: bpftrace   probe: kprobe:{target}\n")
