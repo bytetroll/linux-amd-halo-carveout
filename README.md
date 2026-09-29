@@ -6,22 +6,26 @@ AMD's own Linux distribution.
 
 ```
 $ ./uma-carveout.py list
-installed memory : ~125.6 GiB
+installed memory : ~126.6 GiB
 acpi gpu path    : \_SB_.PCI0.GPPA.VGA_
 sysfs            : /sys/class/drm/card1/device/uma/carveout
 
   idx  name        carveout        OS sees      preset
   ---  ----------  --------------  -----------  ------
-    0  Minimum     512 MB           125.1 GiB  min
-    1  -           1 GiB            124.6 GiB
-    2  -           2 GiB            123.6 GiB
-    3  -           4 GiB            121.6 GiB
-    4  -           8 GiB            117.6 GiB
-    5  -           16 GiB           109.6 GiB
-    6  Medium      32 GiB            93.6 GiB  32
-  * 7  High        64 GiB            61.6 GiB  64
+    0  Minimum     512 MB           126.1 GiB  min
+    1  -           1 GiB            125.6 GiB
+    2  -           2 GiB            124.6 GiB
+    3  -           4 GiB            122.6 GiB
+    4  -           8 GiB            118.6 GiB
+    5  -           16 GiB           110.6 GiB
+    6  Medium      32 GiB            94.6 GiB  32
+    7  High        64 GiB            62.6 GiB  64
+  * 8  unlisted    96 GiB            30.6 GiB  96
 
   * = active
+
+  index 8 is absent from carveout_options: it was set through ATCS, so only
+  mem_info_vram_total attests to the size. The sysfs path cannot reselect it.
 ```
 
 ## The problem
@@ -78,7 +82,8 @@ See **[docs/atcs-atca.md](docs/atcs-atca.md)** for the disassembled ASL.
 ## Install
 
 ```
-git clone <this repo> && cd strix-halo-uma-carveout
+git clone https://github.com/bytetroll/linux-amd-halo-carveout
+cd linux-amd-halo-carveout
 sudo apt install acpica-tools      # for `probe` only
 sudo apt install acpi-call-dkms    # for `set --via atcs` only
 ```
@@ -123,31 +128,47 @@ of the driver instead of guessing one.
 | mainline kernel doc example | — | — | 10 entries, topping out at 32 GB |
 
 **Please send yours.** Paste `./uma-carveout.py list` output plus your BIOS
-version into an issue and it goes in the table. Whether any firmware advertises
-96 GB is the open question below.
+version into an issue and it goes in the table. No firmware seen so far
+advertises 96 GB — but it is reachable anyway; see below.
 
-## The 96 GB question
+## 96 GB: confirmed working
 
 AMD describes the RAH-001 as configurable to 96 GB dedicated (leaving 32 GB for
 the OS), reached on Windows through Adrenalin's **Custom** Variable Graphics
 Memory mode. On BIOS 03.03 the Atom ROM table stops at 64 GB, so the supported
-Linux path cannot request it — but the firmware's ASL will pack index 8 without
-complaint. See [docs/atcs-atca.md](docs/atcs-atca.md).
+Linux path cannot request it.
 
-**This is unverified.** If you try it, please report the outcome either way.
-
-On the RAH-001, `trace` shows every advertised entry going out as **type 2**
-with the ATCS index equal to the sysfs index, so index 8 would be packed as
-`0x28`:
+**Index 8 works anyway.** On the RAH-001, `trace` shows every advertised entry
+going out as **type 2** with the ATCS index equal to the sysfs index, so index 8
+packs as `0x28`:
 
 ```
 sudo ./uma-carveout.py trace                                   # confirm T on your box
 sudo ./uma-carveout.py set 96 --via atcs --index 8 --type 2
+sudo reboot
 ```
 
-If the handler rejects the index, the likely outcome is a fall back to
-`UmaCarveOutIndexDefault` (0, i.e. 512 MB) rather than a failure to boot — a
-visible change you can simply set back.
+Verified on 2026-09-29, AMD Ryzen AI Halo (RAH-001), BIOS 03.03, Ubuntu 26.04.1,
+kernel 7.0.0-34:
+
+```
+$ cat /sys/class/drm/card1/device/uma/carveout
+8
+$ cat /sys/class/drm/card1/device/mem_info_vram_total
+103079215104                       # 96 GiB exactly (96 * 1024**3)
+```
+
+The SMM handler accepts the unadvertised index and POST applies it. Note that
+`103079215104` bytes is 96 **GiB**; tools that divide by 1000^3 render the same
+carveout as "103 GB". Nothing extra was gained — it is the 96 GiB AMD documents.
+
+Afterwards `carveout` reads back `8` while `carveout_options` still stops at 7,
+so the sysfs path can no longer reselect the running size. `set 64` (or any
+advertised index) still works normally and remains the way back.
+
+If your firmware's handler rejects the index, the likely outcome is a fall back
+to `UmaCarveOutIndexDefault` (0, i.e. 512 MB) rather than a failure to boot — a
+visible change you can simply set back. **Please report either outcome.**
 
 ## Consider GTT before a big carveout
 

@@ -132,7 +132,7 @@ UmaCarveOutIndexDefault  = 0x00     # "Minimum", the documented factory default
 So an unadvertised size, if the SMM handler has one, is `type 2` with the next
 index — packed `0x28` for index 8.
 
-## The 96 GB question
+## 96 GB via index 8 -- confirmed
 
 AMD's documentation and retailer material both describe the RAH-001 as
 configurable to 96 GB of dedicated VRAM, reached on Windows through AMD
@@ -141,20 +141,62 @@ Memory -> **Custom**. The Atom ROM table on BIOS 03.03 advertises nothing above
 64 GB, and the Linux sysfs interface is index-only, so Linux cannot ask for it
 through the supported path.
 
-Since `ATCA` will pack index 8 without complaint, the experiment is available:
+`ATCA` packs index 8 without complaint, and **the SMM handler honours it**:
 
 ```
 sudo ./uma-carveout.py trace                                  # learn the type byte
-sudo ./uma-carveout.py set 96 --via atcs --index 8 --type T
+sudo ./uma-carveout.py set 96 --via atcs --index 8 --type 2
+sudo reboot
 ```
 
 `trace` kprobes `amdgpu_acpi_set_uma_allocation_size` and walks the advertised
 indices through the supported sysfs path, so you read a known-good `type` out
 of the driver rather than guessing one.
 
-**Status: unverified.** If you try it, please open an issue with your system,
-BIOS version, the index/type you used, and the resulting
-`mem_info_vram_total` -- positive or negative.
+**Status: verified** on 2026-09-29 -- AMD Ryzen AI Halo (RAH-001), BIOS 03.03,
+Ubuntu 26.04.1, kernel 7.0.0-34, 128 GB:
+
+| | before | after |
+| --- | --- | --- |
+| `uma/carveout` | 7 | **8** |
+| `mem_info_vram_total` | 68719476736 (64 GiB) | **103079215104 (96 GiB)** |
+| `MemTotal` | ~62.6 GiB | ~30.6 GiB |
+
+96 GiB is `103079215104` bytes, which decimal-unit tools display as "103 GB".
+It is the same carveout AMD documents, not a bonus.
+
+So the firmware's option table is a presentation list, not a capability list:
+ATCS reaches at least one size beyond its end. Indices 9-15 are equally
+expressible and remain untested; there is no reason to expect a mapping past
+whatever the Atom ROM actually holds, and an out-of-range index most likely
+lands on `UmaCarveOutIndexDefault`.
+
+After the change `carveout` reads `8` while `carveout_options` still ends at 7,
+so the supported path can no longer reselect the running size -- `list` marks it
+`unlisted` and leans on `mem_info_vram_total`. Writing any advertised index
+through sysfs still works and is the way back.
+
+If you try this, please open an issue with your system, BIOS version, the
+index/type you used, and the resulting `mem_info_vram_total` -- positive or
+negative.
+
+## Calling ATCS by hand
+
+`acpi_call` takes the method path followed by space-separated arguments. ATCS
+uses amdgpu's own convention of two: the function number and the parameter
+buffer.
+
+```
+echo '\_SB_.PCI0.GPPA.VGA_.ATCS 0xa b04000802' > /proc/acpi/call
+cat /proc/acpi/call
+```
+
+The `bNNNN` form is **bare contiguous hex** -- no `0x`, no commas, two digits
+per byte, read up to the next space. `b0x04,0x00,0x08,0x02` is refused during
+parsing with `acpi_call: buffer arg2 is not multiple of 8 bits` in `dmesg`.
+A refused parse means no method is evaluated at all, so reading the file back
+returns the module's idle string `not called` instead of an error -- which is
+easy to mistake for a harmless no-op result, and costs a reboot to discover.
 
 ## Recovery
 
