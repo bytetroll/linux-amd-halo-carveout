@@ -167,6 +167,25 @@ systems. Caveat: reported VRAM does not change, so tools that size allocations
 off `mem_info_vram_total` may plan badly against a tiny carveout — verify with a
 real workload rather than trusting the numbers.
 
+## Secure Boot
+
+`list`, `set` (sysfs), `trace` and `probe` all work with Secure Boot enabled.
+
+`set --via atcs` does not, out of the box: it needs `acpi_call`, which is
+out-of-tree, so `sig_enforce` rejects it until the DKMS signing key is enrolled.
+`apt install acpi-call-dkms` builds and signs the module but does not enroll the
+key, so `modprobe` fails with *Key was rejected by service*. Fix it once:
+
+```
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
+# pick a one-time password, reboot, then in the blue MOK Manager screen:
+# Enroll MOK -> Continue -> Yes -> enter that password
+```
+
+Disabling Secure Boot in firmware setup works too, and additionally lifts kernel
+lockdown. The script detects this situation and prints these steps rather than
+just reporting a missing `/proc/acpi/call`.
+
 ## Risk and recovery
 
 Changing an *advertised* carveout through sysfs is the supported path and is as

@@ -206,6 +206,61 @@ def require_root():
         die("must run as root")
 
 
+
+MOK_DER = "/var/lib/shim-signed/mok/MOK.der"
+
+
+def module_signing_state():
+    """(sig_enforce_on, mok_enrolled) -- mok_enrolled is None if undeterminable."""
+    enforce = False
+    try:
+        with open("/sys/module/module/parameters/sig_enforce") as fh:
+            enforce = fh.read().strip() == "Y"
+    except OSError:
+        pass
+    mok = None
+    if shutil.which("mokutil") and os.path.exists(MOK_DER):
+        r = subprocess.run(["mokutil", "--test-key", MOK_DER],
+                           capture_output=True, text=True)
+        mok = "is not enrolled" not in (r.stdout + r.stderr)
+    return enforce, mok
+
+
+def ensure_acpi_call():
+    """acpi_call is out-of-tree, so Secure Boot makes loading it a whole thing."""
+    if os.path.exists(CALL):
+        return
+    err = "modprobe not found"
+    if shutil.which("modprobe"):
+        r = subprocess.run(["modprobe", "acpi_call"],
+                           capture_output=True, text=True)
+        if os.path.exists(CALL):
+            return
+        err = (r.stderr or r.stdout).strip() or f"modprobe exited {r.returncode}"
+
+    lines = [f"{CALL} is missing and acpi_call would not load.", f"       {err}"]
+    if not os.path.exists("/lib/modules/%s/updates/dkms/acpi_call.ko.zst"
+                          % os.uname().release):
+        lines.append("       install it first: sudo apt install acpi-call-dkms")
+    enforce, mok = module_signing_state()
+    if enforce and mok is False:
+        lines += [
+            "",
+            "       Secure Boot is enforcing module signatures and the DKMS signing",
+            "       key is not enrolled, so this module cannot load. Enroll it:",
+            "",
+            f"         sudo mokutil --import {MOK_DER}",
+            "         # choose a one-time password, reboot, then pick",
+            "         # 'Enroll MOK' -> Continue in the blue MOK Manager screen",
+            "",
+            "       Alternatively disable Secure Boot in firmware setup, which also",
+            "       lifts kernel lockdown. Either way this is a one-time cost.",
+        ]
+    elif enforce and mok is None:
+        lines.append("       Secure Boot is enforcing module signatures; check "
+                     "`mokutil --test-key`.")
+    die("\n".join(lines))
+
 def atcs_call(uma, index, type_, dry_run):
     # struct atcs_set_uma_allocation_size_input {
     #     u16 size; u8 uma_size_index; u8 uma_size_type; } __packed;
@@ -216,9 +271,7 @@ def atcs_call(uma, index, type_, dry_run):
         print("(dry run)")
         return
     require_root()
-    if not os.path.exists(CALL):
-        die(f"{CALL} missing. Install and load acpi_call:\n"
-            "       sudo apt install acpi-call-dkms && sudo modprobe acpi_call")
+    ensure_acpi_call()
 
     errors = []
     for path in atcs_candidates(uma):
