@@ -97,6 +97,41 @@ Method (M232, 3, Serialized)
    cannot be read from the OS. Whether an unadvertised index maps to a real
    size, gets clamped, or is ignored is a property of that handler.
 
+## Observed encoding (RAH-001, BIOS 03.03)
+
+`uma-carveout.py trace` walks every advertised index through the supported sysfs
+path while a BPF kprobe records what `amdgpu` hands to ACPI:
+
+| sysfs index | size | ATCS index | ATCS type | packed byte |
+| --- | --- | --- | --- | --- |
+| 0 | 512 MB | 0 | 2 | `0x20` |
+| 1 | 1 GiB | 1 | 2 | `0x21` |
+| 2 | 2 GiB | 2 | 2 | `0x22` |
+| 3 | 4 GiB | 3 | 2 | `0x23` |
+| 4 | 8 GiB | 4 | 2 | `0x24` |
+| 5 | 16 GiB | 5 | 2 | `0x25` |
+| 6 | 32 GiB | 6 | 2 | `0x26` |
+| 7 | 64 GiB | 7 | 2 | `0x27` |
+
+Two things fall out of this:
+
+1. **The ATCS index is the sysfs index.** No remapping.
+2. **`type` is a platform constant, not a per-entry flag.** Every entry —
+   named preset and plain size alike — is sent as type `2`. It corresponds to
+   `UMASizeControlOption` from the integrated-info table, not to
+   `AMDGPU_UMA_FLAG_AUTO` / `AMDGPU_UMA_FLAG_CUSTOM`; those flags gate whether
+   the driver will *accept* an index, and do not reach the wire.
+
+Independent corroboration from EFI variables on the same machine:
+
+```
+UmaCarveOutDefault       = 0x02     # matches the type byte
+UmaCarveOutIndexDefault  = 0x00     # "Minimum", the documented factory default
+```
+
+So an unadvertised size, if the SMM handler has one, is `type 2` with the next
+index — packed `0x28` for index 8.
+
 ## The 96 GB question
 
 AMD's documentation and retailer material both describe the RAH-001 as

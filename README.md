@@ -136,10 +136,18 @@ complaint. See [docs/atcs-atca.md](docs/atcs-atca.md).
 
 **This is unverified.** If you try it, please report the outcome either way.
 
+On the RAH-001, `trace` shows every advertised entry going out as **type 2**
+with the ATCS index equal to the sysfs index, so index 8 would be packed as
+`0x28`:
+
 ```
-sudo ./uma-carveout.py trace                                   # get T
-sudo ./uma-carveout.py set 96 --via atcs --index 8 --type T
+sudo ./uma-carveout.py trace                                   # confirm T on your box
+sudo ./uma-carveout.py set 96 --via atcs --index 8 --type 2
 ```
+
+If the handler rejects the index, the likely outcome is a fall back to
+`UmaCarveOutIndexDefault` (0, i.e. 512 MB) rather than a failure to boot — a
+visible change you can simply set back.
 
 ## Consider GTT before a big carveout
 
