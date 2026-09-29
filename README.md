@@ -105,6 +105,16 @@ driver sends for each, then restores your original setting. The firmware only
 ever sees values it declared itself. Use it to read a known-good `type` byte out
 of the driver instead of guessing one.
 
+> **Why it uses bpftrace.** Ubuntu (and most distro kernels) ship with
+> `CONFIG_KPROBE_EVENTS_ON_NOTRACE` unset, so writing to `kprobe_events` fails
+> with a bare `EINVAL` — and *nothing* in `/sys/kernel/tracing/error_log`,
+> because the refusal happens before the argument parser ever runs. It is not a
+> syntax problem and no amount of fiddling with `$arg2` vs `%si` or the
+> `module:symbol` prefix will fix it. BPF kprobes register through
+> `create_local_trace_kprobe()`, which does not apply that check, so
+> `--backend bpftrace` (the default when bpftrace is installed) just works.
+> `--backend kprobe` forces the tracefs path if you want to see it fail.
+
 ## Known firmware option tables
 
 | System | BIOS | RAM | Advertised carveouts |

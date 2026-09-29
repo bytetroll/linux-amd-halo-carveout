@@ -21,9 +21,11 @@ import glob
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 # The four steps HP exposes in their BIOS dropdown, in MB.
 PRESETS = {"min": 512, "32": 32768, "64": 65536, "96": 98304}
@@ -360,7 +362,7 @@ def cmd_probe(args):
 TRACE = "/sys/kernel/tracing"
 KPROBE_SYM = "amdgpu_acpi_set_uma_allocation_size"
 KPROBE_NAME = "umaset"
-TRACE_RE = re.compile(r"index=(\d+)\s+type=(\d+)")
+HIT_RE = re.compile(r"index=(\d+)\s+type=(\d+)")
 
 
 def _w(path, data, mode="w"):
@@ -373,64 +375,193 @@ def _r(path):
         return fh.read()
 
 
-def cmd_trace(args):
-    """Watch what index/type the driver actually sends for known-good entries.
+def read_error_log(lines=3):
+    try:
+        text = _r("error_log").strip()
+    except OSError:
+        return ""
+    if not text:
+        return "       (tracefs error_log was empty)"
+    return "\n".join(f"       {ln}" for ln in text.splitlines()[-lines:])
 
-    Everything here goes through the supported sysfs path, so the firmware only
-    ever sees values it advertised. The original setting is restored at the end.
-    """
-    uma = find_card()
-    require_root()
+
+def kprobe_target(sym):
+    """Both kprobe_events and bpftrace accept `module:symbol`."""
+    try:
+        with open("/proc/kallsyms") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) >= 3 and f[2] == sym:
+                    if len(f) >= 4 and f[3].startswith("["):
+                        return f"{f[3].strip('[]')}:{sym}"
+                    return sym
+    except OSError:
+        pass
+    return sym
+
+
+def notrace_gate_closed():
+    """Ubuntu leaves CONFIG_KPROBE_EVENTS_ON_NOTRACE unset, which makes
+    kprobe_events answer -EINVAL for any function ftrace cannot see -- and with
+    nothing in error_log, since the refusal precedes the argument parser. BPF
+    kprobes register by another path and are not subject to that check."""
+    try:
+        with open(f"/boot/config-{os.uname().release}") as fh:
+            return "CONFIG_KPROBE_EVENTS_ON_NOTRACE=y" not in fh.read()
+    except OSError:
+        return False
+
+
+def _wait_hits(path, seen, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        hits = HIT_RE.findall(open(path, errors="replace").read())
+        if len(hits) > seen:
+            return hits
+        time.sleep(0.1)
+    return HIT_RE.findall(open(path, errors="replace").read())
+
+
+def _sweep(indices, node, emit, settle=0.1):
+    """Write each index through sysfs, pairing it with the captured call."""
+    rows, seen = [], 0
+    for idx in indices:
+        try:
+            with open(node, "w") as fh:
+                fh.write(str(idx))
+        except OSError as e:
+            rows.append((idx, None, None, f"write rejected: {e}"))
+            continue
+        hits = emit(seen)
+        if len(hits) > seen:
+            aidx, atype = hits[seen]
+            rows.append((idx, int(aidx), int(atype), ""))
+            seen = len(hits)
+        else:
+            rows.append((idx, None, None, "no ATCS call observed"))
+        time.sleep(settle)
+    return rows
+
+
+def collect_bpftrace(indices, node):
+    target = kprobe_target(KPROBE_SYM)
+    prog = f'kprobe:{target} {{ printf("index=%d type=%d\\n", arg1, arg2); }}'
+    tmp = tempfile.mkdtemp(prefix="uma-trace-")
+    out = os.path.join(tmp, "bpftrace.out")
+    fh = open(out, "w")
+    proc = subprocess.Popen(["bpftrace", "-B", "none", "-e", prog],
+                            stdout=fh, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.time() + 20
+        while "Attaching" not in open(out, errors="replace").read():
+            if proc.poll() is not None:
+                die("bpftrace exited before attaching:\n"
+                    + open(out, errors="replace").read().strip())
+            if time.time() > deadline:
+                die("bpftrace did not attach within 20s:\n"
+                    + open(out, errors="replace").read().strip())
+            time.sleep(0.2)
+        time.sleep(0.3)
+        print(f"backend: bpftrace   probe: kprobe:{target}\n")
+        return _sweep(indices, node, lambda seen: _wait_hits(out, seen, 3.0))
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        fh.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def probe_candidates():
+    tgt = kprobe_target(KPROBE_SYM)
+    targets = [tgt] if tgt == KPROBE_SYM else [tgt, KPROBE_SYM]
+    argsets = ["index=$arg2:u8 type=$arg3:u8", "index=%si:u8 type=%dx:u8"]
+    return [f"p:{KPROBE_NAME} {t} {a}" for a in argsets for t in targets]
+
+
+def collect_kprobe(indices, node):
     if not os.path.isdir(TRACE):
         die(f"{TRACE} missing (tracefs not mounted?)")
-
-    opts = read_options(uma)
-    orig = read_current(uma)
-    indices = args.index if args.index else [i for i, _, _ in opts]
-    unknown = [i for i in indices if i not in {o[0] for o in opts}]
-    if unknown:
-        die(f"index {unknown[0]} is not advertised; trace only uses safe values")
-
     try:
         _w("kprobe_events", f"-:{KPROBE_NAME}\n", "a")
     except OSError:
         pass
-    probe = f"p:{KPROBE_NAME} {KPROBE_SYM} index=$arg2:u8 type=$arg3:u8\n"
-    try:
-        _w("kprobe_events", probe, "a")
-    except OSError as e:
-        die(f"could not install kprobe: {e}\n       probe was: {probe.strip()}")
 
-    node = os.path.join(uma, "carveout")
-    sizes = {i: mb for i, _, mb in opts}
-    names = {i: n for i, n, _ in opts}
-    rows = []
+    probe, failures = None, []
+    for cand in probe_candidates():
+        try:
+            _w("kprobe_events", cand + "\n", "a")
+            probe = cand
+            break
+        except OSError as e:
+            failures.append((cand, e, read_error_log()))
+    if probe is None:
+        print("could not install a kprobe. tried:", file=sys.stderr)
+        for cand, err, log in failures:
+            print(f"  {cand}\n    -> {err}", file=sys.stderr)
+            if log:
+                print(log, file=sys.stderr)
+        if notrace_gate_closed():
+            print("\nCONFIG_KPROBE_EVENTS_ON_NOTRACE is not set on this kernel, so\n"
+                  "kprobe_events refuses any function ftrace cannot see. Use the\n"
+                  "bpftrace backend, which is not subject to that check:\n"
+                  "  sudo apt install bpftrace && ... trace --backend bpftrace",
+                  file=sys.stderr)
+        sys.exit(1)
+
+    print(f"backend: kprobe_events   probe: {probe}\n")
     try:
         _w(f"events/kprobes/{KPROBE_NAME}/enable", "1")
-        for idx in indices:
-            _w("trace", "")
-            try:
-                with open(node, "w") as fh:
-                    fh.write(str(idx))
-            except OSError as e:
-                rows.append((idx, None, None, f"write rejected: {e}"))
-                continue
-            hits = TRACE_RE.findall(_r("trace"))
-            if hits:
-                rows.append((idx, int(hits[-1][0]), int(hits[-1][1]), ""))
-            else:
-                rows.append((idx, None, None, "no ATCS call observed"))
+        trace_file = os.path.join(TRACE, "trace")
+        return _sweep(indices, node,
+                      lambda seen: _wait_hits(trace_file, seen, 1.5))
     finally:
         try:
             _w(f"events/kprobes/{KPROBE_NAME}/enable", "0")
             _w("kprobe_events", f"-:{KPROBE_NAME}\n", "a")
         except OSError:
             pass
+
+
+def cmd_trace(args):
+    """Watch what index/type the driver actually sends for known-good entries.
+
+    Every write goes through the supported sysfs path, so the firmware only ever
+    sees values it advertised itself. The original setting is restored at the end.
+    """
+    uma = find_card()
+    require_root()
+
+    opts = read_options(uma)
+    orig = read_current(uma)
+    indices = args.index if args.index else [i for i, _, _ in opts]
+    advertised = {o[0] for o in opts}
+    unknown = [i for i in indices if i not in advertised]
+    if unknown:
+        die(f"index {unknown[0]} is not advertised; trace only uses safe values")
+
+    backend = args.backend
+    if backend == "auto":
+        backend = "bpftrace" if shutil.which("bpftrace") else "kprobe"
+    if backend == "bpftrace" and not shutil.which("bpftrace"):
+        die("bpftrace not found. sudo apt install bpftrace")
+
+    node = os.path.join(uma, "carveout")
+    sizes = {i: mb for i, _, mb in opts}
+    names = {i: n for i, n, _ in opts}
+    collect = collect_bpftrace if backend == "bpftrace" else collect_kprobe
+
+    rows = []
+    try:
+        rows = collect(indices, node)
+    finally:
         try:
             with open(node, "w") as fh:
                 fh.write(str(orig))
             back = read_current(uma)
-            print(f"restored carveout index {back} "
+            print(f"\nrestored carveout index {back} "
                   f"({fmt_size(sizes.get(back, 0))})\n")
         except OSError as e:
             print(f"WARNING: could not restore index {orig}: {e}", file=sys.stderr)
@@ -450,9 +581,9 @@ def cmd_trace(args):
     if seen_types:
         print(f"\ntype values observed: {seen_types}")
         if len(seen_types) > 1:
-            print("  more than one -> the named presets and the plain sizes use")
-            print("  different types; that is the AUTO vs CUSTOM distinction.")
-        print(f"\nto try 96 GiB (index 8, which ATCA will happily pack):")
+            print("  more than one -> the named presets and the plain sizes are")
+            print("  sent with different types; that is the AUTO/CUSTOM split.")
+        print("\nto try 96 GiB (index 8, which ATCA packs without complaint):")
         for t in seen_types:
             print(f"  sudo {sys.argv[0]} set 96 --via atcs --index 8 --type {t}")
 
@@ -480,6 +611,9 @@ def main():
     tr = sub.add_parser("trace", help="observe the index/type the driver sends")
     tr.add_argument("--index", type=int, action="append",
                     help="only trace these advertised indices (repeatable)")
+    tr.add_argument("--backend", choices=("auto", "bpftrace", "kprobe"),
+                    default="auto",
+                    help="how to capture the call (default: auto)")
 
     pr = sub.add_parser("probe", help="disassemble the firmware's ATCS method")
     pr.add_argument("--method", action="append", metavar="NAME",
